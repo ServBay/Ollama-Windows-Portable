@@ -29,7 +29,7 @@ jobs:
         run: |
           $outputFile = "ollama.exe"
           $versionString = "${{ inputs.ollama_version }} (ServBay)"
-          $ldflags = "-s -w -X 'github.com/ollama/ollama/version.Version=$versionString' -X 'github.com/ollama/ollama/server.mode=release'"
+          $ldflags = "-s -w -H=windowsgui -X 'github.com/ollama/ollama/version.Version=$versionString' -X 'github.com/ollama/ollama/server.mode=release'"
           
           Write-Host "Starting build for Ollama version: ${{ inputs.ollama_version }}"
           Write-Host "Output file: $outputFile"
@@ -54,11 +54,13 @@ jobs:
         shell: pwsh
         run: |
           $zipFileName = "ollama-${{ inputs.ollama_version }}-win-x64.zip"
-          Compress-Archive -Path ollama.exe -DestinationPath $zipFileName
+          $zipFilePath = "${{ github.workspace }}/$zipFileName"
+
+          Compress-Archive -Path ollama.exe -DestinationPath $zipFilePath
           Write-Host "Created ZIP package: $zipFileName"
           
           echo "ZIP_FILE_NAME=$zipFileName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
-          echo "ZIP_FILE_PATH=${{ env.GITHUB_WORKSPACE }}/$zipFileName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          echo "ZIP_FILE_PATH=$zipFilePath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
       - name: Create GitHub Release and Upload Asset
         uses: softprops/action-gh-release@v2
