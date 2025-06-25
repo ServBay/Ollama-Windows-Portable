@@ -66,7 +66,7 @@ jobs:
         uses: softprops/action-gh-release@v2
         if: success()
         with:
-          tag_name: v${{ inputs.ollama_version }}-win-x64
+          tag_name: v${{ inputs.ollama_version }}
           name: Ollama ${{ inputs.ollama_version }} for Windows x64 (ServBay Build)
           body: |
             This is a custom build of Ollama **v${{ inputs.ollama_version }}** for Windows x64.
