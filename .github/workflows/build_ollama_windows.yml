@@ -26,10 +26,14 @@ jobs:
 
       - name: Build Ollama binary
         shell: pwsh
+        env:
+        #   CGO_ENABLED: 0
+          GOOS: windows
+          GOARCH: amd64
         run: |
           $outputFile = "ollama.exe"
           $versionString = "${{ inputs.ollama_version }} (ServBay)"
-          $ldflags = "-s -w -H=windowsgui -X 'github.com/ollama/ollama/version.Version=$versionString' -X 'github.com/ollama/ollama/server.mode=release'"
+          $ldflags = "-s -w -X 'github.com/ollama/ollama/version.Version=$versionString' -X 'github.com/ollama/ollama/server.mode=release'"
           
           Write-Host "Starting build for Ollama version: ${{ inputs.ollama_version }}"
           Write-Host "Output file: $outputFile"
