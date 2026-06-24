@@ -8,6 +8,11 @@ on:
         required: true
         type: string
 
+# Elevate GITHUB_TOKEN so Create GitHub Release works; the org joined an
+# enterprise that reset the repo default workflow permission to read-only.
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: windows-latest
