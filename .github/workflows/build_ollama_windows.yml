@@ -76,22 +76,61 @@ jobs:
             $buildLayout = "legacy"
           }
 
+          # Upstream builds ollama.exe with CGO_ENABLED=1, which links it against
+          # the MinGW runtime (libwinpthread-1.dll, ...). Those DLLs sit on the
+          # CI runner's PATH but not on end-user machines, so ollama.exe dies
+          # with STATUS_DLL_NOT_FOUND (0xC0000135) at launch. Locate the Go cgo
+          # compiler and stage its MinGW runtime DLLs next to ollama.exe.
+          $gcc = Get-Command gcc.exe -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $gcc) {
+            throw "gcc.exe not found on PATH; cannot stage MinGW runtime for ollama.exe."
+          }
+          $gccDir = Split-Path -Parent $gcc.Path
+          Write-Host "Staging MinGW runtime DLLs from: $gccDir"
+          $mingwRuntimeDlls = @(
+            "libwinpthread-1.dll",
+            "libgcc_s_seh-1.dll",
+            "libgcc_s_dw2-1.dll",
+            "libstdc++-6.dll"
+          )
+          $stagedRuntimeDlls = @()
+          foreach ($dll in $mingwRuntimeDlls) {
+            $src = Join-Path $gccDir $dll
+            if (Test-Path $src -PathType Leaf) {
+              Copy-Item -Path $src -Destination (Join-Path $payloadDir $dll) -Force
+              $stagedRuntimeDlls += $dll
+              Write-Host "  staged $dll"
+            }
+          }
+          if ($stagedRuntimeDlls.Count -eq 0) {
+            throw "No MinGW runtime DLLs found next to gcc.exe; ollama.exe would fail to launch on end-user machines."
+          }
+          "STAGED_MINGW_DLLS=$($stagedRuntimeDlls -join ',')" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
           "BUILD_LAYOUT=$buildLayout" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           Write-Host "Build completed using the $buildLayout layout."
 
       - name: Verify build output
         shell: pwsh
+        env:
+          BUILD_LAYOUT: ${{ steps.build.outputs.BUILD_LAYOUT }}
+          STAGED_MINGW_DLLS: ${{ steps.build.outputs.STAGED_MINGW_DLLS }}
         run: |
           $ErrorActionPreference = "Stop"
           $payloadDir = Join-Path $env:GITHUB_WORKSPACE "staging\payload"
           $requiredFiles = @("ollama.exe")
 
-          if ("${{ steps.build.outputs.BUILD_LAYOUT }}" -eq "native") {
+          if ($env:BUILD_LAYOUT -eq "native") {
             $requiredFiles += @(
               "lib\ollama\llama-server.exe",
               "lib\ollama\llama-quantize.exe"
             )
           }
+
+          # libwinpthread-1.dll is required by CGO-linked ollama.exe on every
+          # end-user machine; make it a hard requirement so we never ship a ZIP
+          # that dies with STATUS_DLL_NOT_FOUND on launch.
+          $requiredFiles += "libwinpthread-1.dll"
 
           foreach ($relativePath in $requiredFiles) {
             $file = Join-Path $payloadDir $relativePath
@@ -104,18 +143,29 @@ jobs:
             Write-Host "Verified $relativePath"
           }
 
-          Write-Host "Checking ollama.exe version..."
-          & (Join-Path $payloadDir "ollama.exe") --version
-          if ($LASTEXITCODE -ne 0) {
-            throw "ollama.exe --version failed with exit code $LASTEXITCODE."
-          }
+          # Reproduce an end-user machine by scrubbing PATH down to the two
+          # Windows system dirs. The CI runner ships with MinGW on PATH, which
+          # would otherwise hide missing MinGW runtime DLLs inside the payload.
+          $originalPath = $env:PATH
+          try {
+            $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+            Write-Host "Verifying with isolated PATH: $env:PATH"
 
-          if ("${{ steps.build.outputs.BUILD_LAYOUT }}" -eq "native") {
-            Write-Host "Checking llama-server.exe and its bundled DLL dependencies..."
-            & (Join-Path $payloadDir "lib\ollama\llama-server.exe") --version
+            Write-Host "Checking ollama.exe version..."
+            & (Join-Path $payloadDir "ollama.exe") --version
             if ($LASTEXITCODE -ne 0) {
-              throw "llama-server.exe --version failed with exit code $LASTEXITCODE."
+              throw "ollama.exe --version failed with exit code $LASTEXITCODE under an isolated PATH; the payload is missing a runtime DLL."
             }
+
+            if ($env:BUILD_LAYOUT -eq "native") {
+              Write-Host "Checking llama-server.exe and its bundled DLL dependencies..."
+              & (Join-Path $payloadDir "lib\ollama\llama-server.exe") --version
+              if ($LASTEXITCODE -ne 0) {
+                throw "llama-server.exe --version failed with exit code $LASTEXITCODE under an isolated PATH; the payload is missing a runtime DLL."
+              }
+            }
+          } finally {
+            $env:PATH = $originalPath
           }
 
           Write-Host "Payload contents:"
@@ -125,10 +175,13 @@ jobs:
       - name: Package the payload into a ZIP file
         id: package
         shell: pwsh
+        env:
+          BUILD_LAYOUT: ${{ steps.build.outputs.BUILD_LAYOUT }}
+          OLLAMA_VERSION: ${{ inputs.ollama_version }}
         run: |
           $ErrorActionPreference = "Stop"
-          $zipFileName = "ollama-${{ inputs.ollama_version }}-win-x64.zip"
-          $zipFilePath = "${{ github.workspace }}/$zipFileName"
+          $zipFileName = "ollama-$env:OLLAMA_VERSION-win-x64.zip"
+          $zipFilePath = Join-Path $env:GITHUB_WORKSPACE $zipFileName
           $payloadDir = Join-Path $env:GITHUB_WORKSPACE "staging\payload"
 
           Compress-Archive -Path (Join-Path $payloadDir "*") -DestinationPath $zipFilePath
@@ -137,8 +190,8 @@ jobs:
           $archive = [System.IO.Compression.ZipFile]::OpenRead($zipFilePath)
           try {
             $entries = @($archive.Entries | ForEach-Object { $_.FullName.Replace("\", "/") })
-            $requiredEntries = @("ollama.exe")
-            if ("${{ steps.build.outputs.BUILD_LAYOUT }}" -eq "native") {
+            $requiredEntries = @("ollama.exe", "libwinpthread-1.dll")
+            if ($env:BUILD_LAYOUT -eq "native") {
               $requiredEntries += @(
                 "lib/ollama/llama-server.exe",
                 "lib/ollama/llama-quantize.exe"
