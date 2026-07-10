@@ -18,54 +18,142 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - name: Set up Go environment
-        uses: actions/setup-go@v5
-        with:
-          go-version: '^1.22'
-
       - name: Checkout Ollama source code
         uses: actions/checkout@v4
         with:
           repository: ollama/ollama
           ref: v${{ inputs.ollama_version }}
 
-      - name: Build Ollama binary
+      - name: Set up Go environment
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Build and stage Ollama payload
+        id: build
         shell: pwsh
         env:
-        #   CGO_ENABLED: 0
+          # Keep VERSION free of spaces: upstream passes it through Go ldflags.
+          VERSION: ${{ inputs.ollama_version }}
+          ARCH: amd64
           GOOS: windows
           GOARCH: amd64
         run: |
-          $outputFile = "ollama.exe"
-          $versionString = "${{ inputs.ollama_version }} (ServBay)"
-          $ldflags = "-s -w -X 'github.com/ollama/ollama/version.Version=$versionString' -X 'github.com/ollama/ollama/server.mode=release'"
-          
+          $ErrorActionPreference = "Stop"
+          $payloadDir = Join-Path $env:GITHUB_WORKSPACE "staging\payload"
+          New-Item -ItemType Directory -Force -Path $payloadDir | Out-Null
+
           Write-Host "Starting build for Ollama version: ${{ inputs.ollama_version }}"
-          Write-Host "Output file: $outputFile"
-          Write-Host "Using ldflags: $ldflags"
-          
-          go build -o $outputFile -ldflags="$ldflags" .
-          
-          Write-Host "Build completed."
+          $hasNativePayloadBuild =
+            (Test-Path ".\scripts\build_windows.ps1") -and
+            (Test-Path ".\llama\server\CMakeLists.txt")
+
+          if ($hasNativePayloadBuild) {
+            Write-Host "Detected the native llama-server source layout."
+            & .\scripts\build_windows.ps1 cpu ollama
+            if ($LASTEXITCODE -ne 0) {
+              throw "Upstream Windows build failed with exit code $LASTEXITCODE."
+            }
+
+            $distDir = Join-Path $env:GITHUB_WORKSPACE "dist\windows-amd64"
+            if (-not (Test-Path $distDir -PathType Container)) {
+              throw "Upstream build did not create the expected payload: $distDir"
+            }
+
+            Copy-Item -Path (Join-Path $distDir "*") -Destination $payloadDir -Recurse -Force
+            $buildLayout = "native"
+          }
+          else {
+            Write-Host "Legacy source layout detected; using the Go-only fallback."
+            $outputFile = Join-Path $payloadDir "ollama.exe"
+            $ldflags = "-s -w -X=github.com/ollama/ollama/version.Version=$env:VERSION -X=github.com/ollama/ollama/server.mode=release"
+
+            & go build -trimpath -ldflags $ldflags -o $outputFile .
+            if ($LASTEXITCODE -ne 0) {
+              throw "Legacy Go build failed with exit code $LASTEXITCODE."
+            }
+            $buildLayout = "legacy"
+          }
+
+          "BUILD_LAYOUT=$buildLayout" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          Write-Host "Build completed using the $buildLayout layout."
 
       - name: Verify build output
         shell: pwsh
         run: |
-          if (-not (Test-Path ./ollama.exe)) {
-            Write-Error "Build failed: ollama.exe not found!"
-            exit 1
-          }
-          Write-Host "ollama.exe found. Checking version..."
-          ./ollama.exe --version
+          $ErrorActionPreference = "Stop"
+          $payloadDir = Join-Path $env:GITHUB_WORKSPACE "staging\payload"
+          $requiredFiles = @("ollama.exe")
 
-      - name: Package the binary into a ZIP file
+          if ("${{ steps.build.outputs.BUILD_LAYOUT }}" -eq "native") {
+            $requiredFiles += @(
+              "lib\ollama\llama-server.exe",
+              "lib\ollama\llama-quantize.exe"
+            )
+          }
+
+          foreach ($relativePath in $requiredFiles) {
+            $file = Join-Path $payloadDir $relativePath
+            if (-not (Test-Path $file -PathType Leaf)) {
+              throw "Build failed: required payload file not found: $relativePath"
+            }
+            if ((Get-Item $file).Length -eq 0) {
+              throw "Build failed: required payload file is empty: $relativePath"
+            }
+            Write-Host "Verified $relativePath"
+          }
+
+          Write-Host "Checking ollama.exe version..."
+          & (Join-Path $payloadDir "ollama.exe") --version
+          if ($LASTEXITCODE -ne 0) {
+            throw "ollama.exe --version failed with exit code $LASTEXITCODE."
+          }
+
+          if ("${{ steps.build.outputs.BUILD_LAYOUT }}" -eq "native") {
+            Write-Host "Checking llama-server.exe and its bundled DLL dependencies..."
+            & (Join-Path $payloadDir "lib\ollama\llama-server.exe") --version
+            if ($LASTEXITCODE -ne 0) {
+              throw "llama-server.exe --version failed with exit code $LASTEXITCODE."
+            }
+          }
+
+          Write-Host "Payload contents:"
+          Get-ChildItem -Path $payloadDir -Recurse -File |
+            ForEach-Object { $_.FullName.Substring($payloadDir.Length + 1) }
+
+      - name: Package the payload into a ZIP file
         id: package
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           $zipFileName = "ollama-${{ inputs.ollama_version }}-win-x64.zip"
           $zipFilePath = "${{ github.workspace }}/$zipFileName"
+          $payloadDir = Join-Path $env:GITHUB_WORKSPACE "staging\payload"
 
-          Compress-Archive -Path ollama.exe -DestinationPath $zipFilePath
+          Compress-Archive -Path (Join-Path $payloadDir "*") -DestinationPath $zipFilePath
+
+          Add-Type -AssemblyName System.IO.Compression.FileSystem
+          $archive = [System.IO.Compression.ZipFile]::OpenRead($zipFilePath)
+          try {
+            $entries = @($archive.Entries | ForEach-Object { $_.FullName.Replace("\", "/") })
+            $requiredEntries = @("ollama.exe")
+            if ("${{ steps.build.outputs.BUILD_LAYOUT }}" -eq "native") {
+              $requiredEntries += @(
+                "lib/ollama/llama-server.exe",
+                "lib/ollama/llama-quantize.exe"
+              )
+            }
+            foreach ($entry in $requiredEntries) {
+              if ($entries -notcontains $entry) {
+                throw "ZIP verification failed: required entry not found: $entry"
+              }
+            }
+          }
+          finally {
+            $archive.Dispose()
+          }
+
           Write-Host "Created ZIP package: $zipFileName"
           
           echo "ZIP_FILE_NAME=$zipFileName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
