@@ -7,6 +7,11 @@ on:
         description: 'The Ollama version to build (e.g., 0.1.43). The workflow will checkout tag v<version>.'
         required: true
         type: string
+      dry_run:
+        description: 'Build and verify without creating or updating a Release'
+        required: false
+        type: boolean
+        default: false
 
 # Elevate GITHUB_TOKEN so Create GitHub Release works; the org joined an
 # enterprise that reset the repo default workflow permission to read-only.
@@ -15,20 +20,37 @@ permissions:
 
 jobs:
   build:
-    runs-on: windows-latest
+    # CUDA 12.8 supports Visual Studio 2022, not newer MSVC releases.
+    runs-on: windows-2022
+    defaults:
+      run:
+        working-directory: source
 
     steps:
+      - name: Checkout portable package checks
+        uses: actions/checkout@v4
+
       - name: Checkout Ollama source code
         uses: actions/checkout@v4
         with:
           repository: ollama/ollama
           ref: v${{ inputs.ollama_version }}
+          path: source
+
+      - name: Test portable package checks
+        shell: pwsh
+        working-directory: ${{ github.workspace }}
+        run: |
+          python -B -m unittest discover -s "$env:GITHUB_WORKSPACE\tests" -v
+          if ($LASTEXITCODE -ne 0) {
+            throw "Portable package checks failed with exit code $LASTEXITCODE."
+          }
 
       - name: Set up Go environment
         uses: actions/setup-go@v5
         with:
-          go-version-file: go.mod
-          cache-dependency-path: go.sum
+          go-version-file: source/go.mod
+          cache-dependency-path: source/go.sum
 
       - name: Build and stage Ollama payload
         id: build
@@ -44,19 +66,83 @@ jobs:
           $payloadDir = Join-Path $env:GITHUB_WORKSPACE "staging\payload"
           New-Item -ItemType Directory -Force -Path $payloadDir | Out-Null
 
-          Write-Host "Starting build for Ollama version: ${{ inputs.ollama_version }}"
+          Write-Host "Starting build for Ollama version: $env:VERSION"
           $hasNativePayloadBuild =
             (Test-Path ".\scripts\build_windows.ps1") -and
             (Test-Path ".\llama\server\CMakeLists.txt")
 
           if ($hasNativePayloadBuild) {
             Write-Host "Detected the native llama-server source layout."
+            # Use the same Ninja/MSVC toolchain as the official Windows release.
+            & choco install -y --no-progress ninja
+            if ($LASTEXITCODE -ne 0) {
+              throw "Ninja installation failed with exit code $LASTEXITCODE."
+            }
+            $env:CMAKE_GENERATOR = "Ninja"
+            $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+            $vsInstall = & $vswhere -latest -products * -version '[17.0,18.0)' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+            if ($LASTEXITCODE -ne 0 -or -not $vsInstall) {
+              throw "Visual Studio 2022 C++ tools were not found."
+            }
+            Import-Module (Join-Path $vsInstall "Common7\Tools\Microsoft.VisualStudio.DevShell.dll")
+            Enter-VsDevShell -VsInstallPath $vsInstall -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64 -no_logo'
+
+            # cpu clears dist; build it before adding either GPU backend.
             & .\scripts\build_windows.ps1 cpu ollama
             if ($LASTEXITCODE -ne 0) {
               throw "Upstream Windows build failed with exit code $LASTEXITCODE."
             }
 
-            $distDir = Join-Path $env:GITHUB_WORKSPACE "dist\windows-amd64"
+            $cudaToolkits = @(
+              @{
+                Version = "12.8"
+                Backend = "cuda12"
+                Url = "https://developer.download.nvidia.com/compute/cuda/12.8.0/local_installers/cuda_12.8.0_571.96_windows.exe"
+                Components = @("cudart", "nvcc", "cublas", "cublas_dev")
+              },
+              @{
+                Version = "13.0"
+                Backend = "cuda13"
+                Url = "https://developer.download.nvidia.com/compute/cuda/13.0.0/local_installers/cuda_13.0.0_windows.exe"
+                Components = @("cudart", "nvcc", "cublas", "cublas_dev", "crt", "nvvm", "nvptxcompiler")
+              }
+            )
+            $ProgressPreference = 'SilentlyContinue'
+            foreach ($toolkit in $cudaToolkits) {
+              $installer = Join-Path $env:RUNNER_TEMP "cuda-$($toolkit.Version)-installer.exe"
+              try {
+                Invoke-WebRequest -Uri $toolkit.Url -OutFile $installer
+                $components = @($toolkit.Components | ForEach-Object { "${_}_$($toolkit.Version)" })
+                $installation = Start-Process -FilePath $installer -ArgumentList (@("-s") + $components) -NoNewWindow -PassThru -Wait
+                if ($installation.ExitCode -ne 0) {
+                  throw "CUDA $($toolkit.Version) installation failed with exit code $($installation.ExitCode)."
+                }
+              }
+              finally {
+                # Remove only this downloaded installer to leave room for the ZIP.
+                if (Test-Path -LiteralPath $installer -PathType Leaf) {
+                  Remove-Item -LiteralPath $installer -Force
+                }
+              }
+
+              # Upstream silently skips CUDA when no toolkit is found. Fail here
+              # instead, and check the final backend DLLs with the shared validator.
+              $cudaRoot = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v$($toolkit.Version)"
+              $nvcc = Join-Path $cudaRoot "bin\nvcc.exe"
+              if (-not (Test-Path -LiteralPath $nvcc -PathType Leaf)) {
+                throw "CUDA $($toolkit.Version) installation did not provide nvcc.exe."
+              }
+              $nvccVersion = & $nvcc --version
+              if ($LASTEXITCODE -ne 0 -or ($nvccVersion -join "`n") -notmatch "release $([regex]::Escape($toolkit.Version)),") {
+                throw "Unexpected nvcc version for CUDA $($toolkit.Version): $nvccVersion"
+              }
+              & .\scripts\build_windows.ps1 $toolkit.Backend
+              if ($LASTEXITCODE -ne 0) {
+                throw "Upstream $($toolkit.Backend) build failed with exit code $LASTEXITCODE."
+              }
+            }
+
+            $distDir = Join-Path $env:GITHUB_WORKSPACE "source\dist\windows-amd64"
             if (-not (Test-Path $distDir -PathType Container)) {
               throw "Upstream build did not create the expected payload: $distDir"
             }
@@ -114,33 +200,13 @@ jobs:
         shell: pwsh
         env:
           BUILD_LAYOUT: ${{ steps.build.outputs.BUILD_LAYOUT }}
-          STAGED_MINGW_DLLS: ${{ steps.build.outputs.STAGED_MINGW_DLLS }}
         run: |
           $ErrorActionPreference = "Stop"
           $payloadDir = Join-Path $env:GITHUB_WORKSPACE "staging\payload"
-          $requiredFiles = @("ollama.exe")
-
-          if ($env:BUILD_LAYOUT -eq "native") {
-            $requiredFiles += @(
-              "lib\ollama\llama-server.exe",
-              "lib\ollama\llama-quantize.exe"
-            )
-          }
-
-          # libwinpthread-1.dll is required by CGO-linked ollama.exe on every
-          # end-user machine; make it a hard requirement so we never ship a ZIP
-          # that dies with STATUS_DLL_NOT_FOUND on launch.
-          $requiredFiles += "libwinpthread-1.dll"
-
-          foreach ($relativePath in $requiredFiles) {
-            $file = Join-Path $payloadDir $relativePath
-            if (-not (Test-Path $file -PathType Leaf)) {
-              throw "Build failed: required payload file not found: $relativePath"
-            }
-            if ((Get-Item $file).Length -eq 0) {
-              throw "Build failed: required payload file is empty: $relativePath"
-            }
-            Write-Host "Verified $relativePath"
+          $validator = Join-Path $env:GITHUB_WORKSPACE ".github\scripts\verify_payload.py"
+          & python $validator --payload $payloadDir --layout $env:BUILD_LAYOUT
+          if ($LASTEXITCODE -ne 0) {
+            throw "Payload verification failed with exit code $LASTEXITCODE."
           }
 
           # Reproduce an end-user machine by scrubbing PATH down to the two
@@ -184,27 +250,12 @@ jobs:
           $zipFilePath = Join-Path $env:GITHUB_WORKSPACE $zipFileName
           $payloadDir = Join-Path $env:GITHUB_WORKSPACE "staging\payload"
 
-          Compress-Archive -Path (Join-Path $payloadDir "*") -DestinationPath $zipFilePath
-
           Add-Type -AssemblyName System.IO.Compression.FileSystem
-          $archive = [System.IO.Compression.ZipFile]::OpenRead($zipFilePath)
-          try {
-            $entries = @($archive.Entries | ForEach-Object { $_.FullName.Replace("\", "/") })
-            $requiredEntries = @("ollama.exe", "libwinpthread-1.dll")
-            if ($env:BUILD_LAYOUT -eq "native") {
-              $requiredEntries += @(
-                "lib/ollama/llama-server.exe",
-                "lib/ollama/llama-quantize.exe"
-              )
-            }
-            foreach ($entry in $requiredEntries) {
-              if ($entries -notcontains $entry) {
-                throw "ZIP verification failed: required entry not found: $entry"
-              }
-            }
-          }
-          finally {
-            $archive.Dispose()
+          [System.IO.Compression.ZipFile]::CreateFromDirectory($payloadDir, $zipFilePath)
+          $validator = Join-Path $env:GITHUB_WORKSPACE ".github\scripts\verify_payload.py"
+          & python $validator --archive $zipFilePath --layout $env:BUILD_LAYOUT
+          if ($LASTEXITCODE -ne 0) {
+            throw "ZIP verification failed with exit code $LASTEXITCODE."
           }
 
           Write-Host "Created ZIP package: $zipFileName"
@@ -212,9 +263,19 @@ jobs:
           echo "ZIP_FILE_NAME=$zipFileName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
           echo "ZIP_FILE_PATH=$zipFilePath" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
 
+      - name: Save dry-run package
+        if: ${{ success() && inputs.dry_run }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: ollama-${{ inputs.ollama_version }}-win-x64-dryrun
+          path: ${{ steps.package.outputs.ZIP_FILE_PATH }}
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
       - name: Create GitHub Release and Upload Asset
         uses: softprops/action-gh-release@v2
-        if: success()
+        if: ${{ success() && inputs.dry_run == false }}
         with:
           tag_name: v${{ inputs.ollama_version }}
           name: Ollama ${{ inputs.ollama_version }} for Windows x64 (ServBay Build)
