@@ -12,6 +12,11 @@ on:
         required: false
         type: boolean
         default: false
+      builder_dry_run:
+        description: 'dry_run flag passed back to the Builder release callback (Uploader plans only when true)'
+        required: false
+        type: boolean
+        default: true
 
 # Elevate GITHUB_TOKEN so Create GitHub Release works; the org joined an
 # enterprise that reset the repo default workflow permission to read-only.
@@ -287,3 +292,31 @@ jobs:
           files: ${{ steps.package.outputs.ZIP_FILE_PATH }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Notify Builder release is ready
+        # Fired only when a release was actually published (dry_run builds
+        # create none). ServBay/ServBay-PKG-Builder-v1's
+        # build-windows-async.yml repackages the release and hands it to the
+        # Uploader. BUILDER_DISPATCH_PAT needs contents:write on that repo.
+        # Failing loudly is safe: the Builder nightly self-heals through its
+        # release-already-built path if this callback is lost.
+        if: ${{ success() && inputs.dry_run == false }}
+        shell: pwsh
+        working-directory: ${{ github.workspace }}
+        env:
+          GH_TOKEN: ${{ secrets.BUILDER_DISPATCH_PAT }}
+          BUILDER_REPO: ServBay/ServBay-PKG-Builder-v1
+          OLLAMA_VERSION: ${{ inputs.ollama_version }}
+          BUILDER_DRY_RUN: ${{ inputs.builder_dry_run }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          gh api "repos/$env:BUILDER_REPO/dispatches" `
+            -f event_type=upstream-release-ready `
+            -f "client_payload[pkg]=ollama" `
+            -f "client_payload[version]=$env:OLLAMA_VERSION" `
+            -f "client_payload[arch]=x64" `
+            -f "client_payload[os]=windows" `
+            -f "client_payload[dry_run]=$env:BUILDER_DRY_RUN"
+          if ($LASTEXITCODE -ne 0) {
+            throw "Builder dispatch failed with exit code $LASTEXITCODE."
+          }
